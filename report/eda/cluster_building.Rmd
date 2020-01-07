@@ -1,0 +1,229 @@
+---
+title: "Building clustering"
+author: "Joan Claverol Romero"
+date: "02/12/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F)
+# libraries
+if (require(pacman) == FALSE) {
+  install.packages("pacman")
+}
+pacman::p_load(tidyverse, magrittr, kableExtra, knitr, caret)
+
+# setting visualization themes ggplot
+theme_set(theme_bw())
+```
+
+## GOAL
+
+Use techniques like:
+
+* k-means
+* dendogram
+* PCA
+
+To find the closer waps to predict the buildings. 
+
+First we will use latitude and longitude, and then only the WAPs information. 
+
+## Load data
+
+We will use for the moment the traian data. We will load the rds file preparated by the files `preparation_rds.R`:
+
+```{r}
+train <- read_rds("../../data/clean/train.rds")
+```
+
+Let's see if we can use clustering techniques: 
+
+```{r}
+train_gath <- train %>% 
+  # gather the WAPS to two columns: WAPs and their values
+  pivot_longer(cols = starts_with("WAP"), names_to = "WAPs") %>% 
+  select(LONGITUDE, LATITUDE, BUILDINGID, WAPs, value, PHONEID) %>% 
+  filter(value != 100)
+```
+
+Do we have duplicates inside our data?
+
+* Now the dataset contains `r nrow(train_gath)`. Let's take out the duplicates. 
+
+```{r}
+train_unique <- train_gath %>% 
+  filter(value != 100) %>% # filter out the non detected WAPs
+  distinct_all(.keep_all = T) # Make sure we have unique observations
+```
+
+Now our dataset has been reduced to `r nrow(train_gath)`. As our first step will be to create cluster by latitude and longitude, we will not use the WAPs value. We will use k-mean forr the first approach. 
+
+As we want to detect the 3 main buildings, we will define as k = 3. 
+
+```{r}
+# define set seed and apply the k-means
+set.seed(45)
+k <- 6 # define number of centers
+kmeans_results <- kmeans(
+      x = train_unique %>% select(LATITUDE, LONGITUDE), # only LAT & LONG
+      centers = k
+    )
+# store your results
+train_unique %<>% 
+  mutate(clust_kmeans = kmeans_results$cluster)
+```
+
+Let's plot our results: 
+
+```{r}
+# plot the kmeans results 
+# first add the medoids in the data
+train_unique <- as_tibble(kmeans_results$centers) %>% 
+  mutate(WAPs = "WAPs_kmeans") %>% 
+  bind_rows(train_unique) # add the centers into the dataset
+plot_kmeans <- train_unique %>% 
+  ggplot(aes(x = LONGITUDE, y = LATITUDE, col = factor(clust_kmeans))) +
+    geom_point() +
+    geom_point(aes(x = if_else(WAPs == "WAPs_kmeans", LONGITUDE, NULL), 
+                   y = if_else(WAPs == "WAPs_kmeans", LATITUDE, NULL)),
+               col = "red")
+# plot the results 
+plot_kmeans
+```
+
+If we focus at the information by building we will be able to detect whihc are the WAPs closer to the center of our k-means:
+
+```{r}
+# show a table of the centroids
+kable(
+  train_unique %>% 
+    filter(WAPs == "WAPs_kmeans") %>% 
+    select(LATITUDE, LONGITUDE, clust_kmeans)
+  ) %>%  
+  kable_styling(full_width = F)
+# data frame with all the centers and the correct buildings
+train_unique %>%
+  filter(WAPs == "WAPs_kmeans") %>%
+  select(LATITUDE, LONGITUDE) %>%
+  mutate(BUILDINGID = if_else(between(LONGITUDE, -7700, -7600), 0, 
+                              if_else(between(LONGITUDE, -7600, -7400), 1, 2)
+                              )
+         ) %>% 
+  arrange(BUILDINGID) %>% 
+  rownames_to_column(var = "center_id") %>% 
+  assign("center_b", ., envir = .GlobalEnv)
+```
+
+TO filter the WAPs that are closer to this position, first we will have to predict where is the position of each WAP:
+
+```{r}
+WAPs_pred_loc <- train_unique %>% 
+  # exlclude kmeans centers
+  filter(WAPs != "WAPs_kmeans") %>%
+  # avoid duplicated values
+  distinct(LATITUDE, LONGITUDE, WAPs) %>%
+  # use the median by wap to try to predict where the WAP has more presence
+  group_by(WAPs) %>% 
+  summarise(LATITUDE = median(LATITUDE), 
+            LONGITUDE = median(LONGITUDE))
+# plot the results
+WAPs_pred_loc %>% 
+  ggplot(aes(x = LONGITUDE, y = LATITUDE)) +
+    geom_point()
+```
+
+
+Now we will select the best WAPs based on the centers of the buildings. We will start by the building 0:
+
+
+```{r}
+# We will use only LONGITUDE as is the only variable who is not corssing the 
+# other buildings
+LAT_tresh <- 0 # define treshhold LATITUDE
+LONG_tresh <- 1.9 # define treshhold LONGITUDE
+imp_WAPs <- tibble()
+for (i in 1:k) {
+  temp_waps <- WAPs_pred_loc %>% 
+    filter(
+      between(
+        x = LONGITUDE, 
+        left = center_b$LONGITUDE[i] - LONG_tresh, 
+        right = center_b$LONGITUDE[i] + LONG_tresh
+        ) | 
+      between(
+        x = LATITUDE, 
+        left = center_b$LATITUDE[i] - LAT_tresh, 
+        right = center_b$LATITUDE[i] + LAT_tresh
+        )
+      ) %>% 
+    distinct(WAPs, .keep_all = F) %>% 
+    assign(paste0("imp_waps_center", i), ., envir = .GlobalEnv)
+  
+  # store your resuls in a tibble
+  imp_WAPs %<>% 
+    bind_rows(temp_waps) %>% 
+    distinct(WAPs)
+}
+# where are placed the localised waps?
+train_unique %>% 
+  ggplot(aes(x = LONGITUDE, y = LATITUDE)) +
+    geom_point() +
+    geom_point(aes(
+      x = if_else(WAPs %in% imp_WAPs$WAPs, LONGITUDE, NULL),
+      y = if_else(WAPs %in% imp_WAPs$WAPs, LATITUDE, NULL),
+    ), col = "red")
+  
+```
+
+### Apply the model on the train data
+
+Now we have the best WAPs to predict, at least, the Building: 
+
+```{r}
+train_b <- train %>% 
+  select(imp_WAPs$WAPs, BUILDINGID) %>% 
+  distinct_all()
+```
+
+Now we will create our train and test with caret: 
+
+```{r}
+# train and test creation 
+train_id <- createDataPartition(y = train_b$BUILDINGID, 
+                                p = 0.75, 
+                                list = F)
+training <- train_b[train_id,]
+testing <- train_b[-train_id,]
+```
+
+Let's create a simple model, like a simple decision tree: 
+
+```{r}
+library(doParallel)
+cl <- makeCluster(detectCores() - 1)
+system.time({
+  registerDoParallel(cl)
+  mod <- caret::train(
+    factor(BUILDINGID) ~ .,
+    data = train_b, 
+    method = "rf",
+    ntree = 20
+  )
+  stopCluster(cl)
+})
+
+mod
+```
+
+Results on the test: 
+
+```{r}
+validation <- read_rds("../../data/clean/validation.rds")
+
+confusionMatrix(data =  predict(mod, validation), 
+                reference = factor(validation$BUILDINGID), 
+                dnn = c("Prediction", "Reference"))
+```
+
+This results is not working properly. Bad results on validation. 
